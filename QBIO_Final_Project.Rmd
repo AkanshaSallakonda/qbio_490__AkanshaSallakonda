@@ -1,0 +1,225 @@
+---
+title: "QBIO_Final_Project"
+---
+
+
+```{r setup, include=FALSE}
+ knitr::opts_knit$set(root.dir = normalizePath("/Users/akki/Desktop/USC/FreshmanYear/QBIO490/FinalProject/qbio_tcga_hnsc/analysis_data"))
+
+```
+
+## R Markdown
+
+This is an R Markdown document. Markdown is a simple formatting syntax for authoring HTML, PDF, and MS Word documents. For more details on using R Markdown see <http://rmarkdown.rstudio.com>.
+
+When you click the **Knit** button a document will be generated that includes both content as well as the output of any embedded R code chunks within the document. You can embed an R code chunk like this:
+
+```{r}
+# install, only if needed, and load packages (SummarizedExperiment anda TCGAbiolinks)
+library(BiocManager)
+library(TCGAbiolinks)
+library(maftools)
+library(ggplot2)
+library (SummarizedExperiment)
+library(DESeq2)
+library(EnhancedVolcano)
+library(survminer)
+library(survival)
+library(dplyr)
+```
+
+```{r}
+#neccessary downloads and preparation for clinical files
+
+library(TCGAbiolinks)
+
+clin_query <- GDCquery(project = "TCGA-HNSC",
+                       data.category = "Clinical",
+                       data.type = "Clinical Supplement",
+                       data.format = 'BCR Biotab')
+GDCdownload(clin_query)
+clinical.BCRtab.all <- GDCprepare(clin_query)  
+clinic <- clinical.BCRtab.all$clinical_patient_hnsc[-c(1,2),]
+
+colnames(clinic)[ colnames(clinic) == "bcr_patient_barcode" ] <- "Tumor_Sample_Barcode"
+
+write.csv(clinic,"/Users/akki/Desktop/USC/FreshmanYear/QBIO490/FinalProject/qbio_tcga_hnsc/analysis_data/hnsc_clinical_data.csv", row.names=FALSE)
+
+clinic <- read.csv("/Users/akki/Desktop/USC/FreshmanYear/QBIO490/FinalProject/qbio_tcga_hnsc/analysis_data/hnsc_clinical_data.csv")
+
+```
+
+```{r}
+#neccessary downloads and preparation for rna_se files
+
+#library(TCGAbiolinks)
+
+rna_query <- GDCquery(project ="TCGA-HNSC",
+                      data.category = "Transcriptome Profiling",
+                      data.type = "Gene Expression Quantification",
+                      workflow.type = "STAR - Counts")
+GDCdownload(rna_query)
+rna_se <- GDCprepare(rna_query)
+
+rna_clinical <- rna_se@colData
+rna_clinical <- as.data.frame(rna_clinical)
+rna_clinical$Tumor_Sample_Barcode <- rna_clinical$patient
+
+```
+
+
+```{r}
+#neccessary downloads and preparation for MAF files
+
+library(maftools)
+
+clinical <- read.csv("/Users/akki/Desktop/USC/FreshmanYear/QBIO490/FinalProject/qbio_tcga_hnsc/analysis_data/hnsc_clinical_data.csv")
+colnames(clinical)[ colnames(clinical) == "bcr_patient_barcode" ] <- "Tumor_Sample_Barcode"
+write.csv(clinical, "/Users/akki/Desktop/USC/FreshmanYear/QBIO490/FinalProject/qbio_tcga_hnsc/analysis_data/hnsc_clinical_data.csv", row.names = FALSE)
+
+maf_query <- GDCquery(
+  project = "TCGA-HNSC", 
+  data.category = "Simple Nucleotide Variation", 
+  access = "open", # we only have access to somatic mutations which are open access
+  data.type = "Masked Somatic Mutation", 
+  workflow.type = "Aliquot Ensemble Somatic Variant Merging and Masking"
+)
+
+GDCdownload(maf_query)
+
+maf <- GDCprepare(maf_query) # as long as it runs, ignore any errors
+
+maf_object <- read.maf(maf = maf, 
+                       clinicalData = rna_clinical,
+                       isTCGA = TRUE)
+```
+
+
+```{r}
+
+mask_alc <- ifelse(rna_clinical$alcohol_history == "Yes", TRUE, FALSE)
+mask_noalc <- ifelse(rna_clinical$alcohol_history == "No", TRUE, FALSE)
+
+both <- rna_clinical[mask_alc, ]
+both <- both[!is.na(both$cigarettes_per_day), ]
+
+alc_only <- rna_clinical[mask_alc, ]
+alc_only <- alc_only[is.na(alc_only$cigarettes_per_day), ]
+
+cig_only <- rna_clinical[mask_noalc, ]
+cig_only <- cig_only[!is.na(cig_only$cigarettes_per_day), ]
+
+rna_clinical$both_alc_cig <- ifelse(rna_clinical$barcode %in% both$barcode, "Yes", "No")
+
+rna_clinical$only_alc <- ifelse(rna_clinical$barcode %in% alc_only$barcode, "Yes", "No")
+
+rna_clinical$only_cig <- ifelse(rna_clinical$barcode %in% cig_only$barcode, "Yes", "No")
+
+```
+
+```{r}
+#Cigarettes Only
+
+#Creation of tissue mask
+cig_tissue_mask <- (cig_only$cigarettes_per_day > 0 | cig_only$definition == "Primary solid Tumor")
+cig_only <- cig_only[cig_tissue_mask, ]
+
+
+#Creation of smoking status variable
+cig_only$smoking_status <- ifelse(cig_only$cigarettes_per_day > 0 | cig_only$definition == "Primary solid Tumor", "yes", "no")
+cig_only$smoking_status <- factor(cig_only$smoking_status, levels = c("no", "yes"))
+
+
+#Creation of smoking status mask
+cig_only_mask <- ifelse(cig_only$smoking_status == "yes", T, F)
+cig_only$smoking_status <- cig_only_mask
+cig_only$smoking_status <- factor(cig_only$smoking_status)
+
+
+#Creation of survival time variable
+cig_only$survival_time <- ifelse(!is.na(cig_only$days_to_death), 
+                                 cig_only$days_to_last_follow_up, 
+                                 cig_only$days_to_death)
+
+cig_only$survival_time <- as.numeric(cig_only$survival_time)
+cig_only <- cig_only[!is.na(cig_only$survival_time),]
+
+#Creation of death event variable
+cig_only$death_event <- ifelse(cig_only$vital_status == "Dead", T, F)
+
+#Creation of survival_object
+survival_object <- Surv(time = cig_only$survival_time, 
+                        event = cig_only$death_event)
+
+#Fitting Kaplan Meier Model
+fit_object <- survfit(survival_object ~ smoking_status, data = cig_only)
+
+#Creating Kaplan Meier Model
+survplot <- ggsurvplot(fit_object,
+                       pval=TRUE,
+                       ggtheme = theme(plot.margin = unit(c(1,1,1,1), "cm")),
+                       legend = 'right')
+
+#Customizing Kaplan Meier Plot
+KM_plot <- survplot$plot + theme_bw() + theme(axis.title = element_text(size=20), 
+                                              axis.text = element_text(size=16),
+                                              legend.title = element_text(size=14),
+                                              legend.text = element_text(size=12))
+
+
+KM_plot
+
+```
+```{r}
+#Alcohol Only
+
+#Creation of alcohol tissue mask
+alc_tissue_mask <- (alc_only$alcohol_history == "Yes" | alc_only$definition == "Primary solid Tumor")
+alc_only <- alc_only[alc_tissue_mask, ]
+
+#Creation of drinking_status variable
+alc_only$drinking_status <- ifelse(alc_only$alcohol_history == "Yes" | alc_only$definition == "Primary solid Tumor", "yes", "no")
+alc_only$drinking_status <- factor(alc_only$drinking_status, levels = c("no", "yes"))
+
+#Creation of drinking_status mask
+alc_only_mask <- ifelse(alc_only$drinking_status == "yes", T, F)
+alc_only$drinking_status <- alc_only_mask
+alc_only$drinking_status <- factor(alc_only$drinking_status)
+
+#Creation of survival_time variable
+alc_only$survival_time <- ifelse(!is.na(alc_only$days_to_death), 
+                                 alc_only$days_to_last_follow_up, 
+                                 alc_only$days_to_death)
+
+alc_only$survival_time <- as.numeric(alc_only$survival_time)
+alc_only <- alc_only[!is.na(alc_only$survival_time),]
+
+#Creation of death_event variable
+alc_only$death_event <- ifelse(alc_only$vital_status == "Dead", T, F)
+
+#Creation of survival_object
+survival_object <- Surv(time = alc_only$survival_time, 
+                        event = alc_only$death_event)
+
+#Fitting Kaplan Meier Model
+fit_object <- survfit(survival_object ~ drinking_status, data = alc_only)
+
+#Creating Kaplan Meier Model
+survplot <- ggsurvplot(fit_object,
+                       pval=TRUE,
+                       ggtheme = theme(plot.margin = unit(c(1,1,1,1), "cm")),
+                       legend = 'right')
+
+#Customizing Kaplan Meier Model
+KM_plot <- survplot$plot + theme_bw() + theme(axis.title = element_text(size=20), 
+                                              axis.text = element_text(size=16),
+                                              legend.title = element_text(size=14),
+                                              legend.text = element_text(size=12))
+
+
+KM_plot
+
+
+```
+
+Note that the `echo = FALSE` parameter was added to the code chunk to prevent printing of the R code that generated the plot.
